@@ -1108,7 +1108,13 @@ print_final_summary() {
     echo -e "  Restart bench   : ${CYAN}bench restart${NC}"
     echo -e "  Site backup     : ${CYAN}bench --site ${SITE_NAME} backup${NC}"
     echo -e "  Install app     : ${CYAN}bench get-app <app_name> && bench --site ${SITE_NAME} install-app <app_name>${NC}"
-    echo -e "  Update bench    : ${CYAN}bench update${NC}\n"
+    echo -e "  Update bench    : ${CYAN}bench update${NC}"
+
+    echo -e "\n${BOLD}${CYAN}--- Enterprise Support & Consulting ---${NC}"
+    echo -e "  Provided by     : ${BOLD}CodeProMax Tech${NC} (https://codepromax.com.de/)"
+    echo -e "  WhatsApp / Call : ${GREEN}+880 130 201 6151${NC} / ${GREEN}+880 176 441 4949${NC}"
+    echo -e "  Email           : ${CYAN}codepromaxtech@gmail.com${NC}"
+    echo -e "  Support Hours   : Sun - Thu: 09:00 AM – 06:00 PM (Emergency 24/7)\n"
 }
 
 # ------------------------------------------------------------------------------

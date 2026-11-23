@@ -390,6 +390,12 @@ EOF
     echo -e "    Container status      : ${CYAN}pct status ${CT_ID}${NC}"
     echo -e "    Reboot container      : ${CYAN}pct reboot ${CT_ID}${NC}"
     echo -e "    Stop container        : ${CYAN}pct stop ${CT_ID}${NC}"
+    echo -e "${CYAN}----------------------------------------------------------------${NC}"
+    echo -e "  ${BOLD}Commercial Support & Services: CodeProMax Tech${NC}"
+    echo -e "    Website  : https://codepromax.com.de/"
+    echo -e "    Hotline  : +880 130 201 6151 (WhatsApp) / +880 176 441 4949"
+    echo -e "    Email    : codepromaxtech@gmail.com"
+    echo -e "    Hours    : Sun - Thu 09:00 AM – 06:00 PM (Emergency 24/7)"
     echo -e "${GREEN}================================================================${NC}\n"
 }
 
