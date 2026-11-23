@@ -41,6 +41,7 @@ Need expert assistance with ERPNext implementation, custom app development, Clou
 - [📦 Proxmox VE LXC Automated Deployment](#-proxmox-ve-lxc-automated-deployment)
 - [✨ Key Capabilities & Highlights](#-key-capabilities--highlights)
 - [🤖 Non-Interactive Automation (CLI Flags Reference)](#-non-interactive-automation-cli-flags-reference)
+- [🧹 Old Installation Cleanup & Uninstaller](#-old-installation-cleanup--uninstaller)
 - [🛡️ Production Architecture & Auto-Start Recovery on Reboot](#️-production-architecture--auto-start-recovery-on-reboot)
 - [☁️ Cloudflare Proxy & SSL Configuration](#️-cloudflare-proxy--ssl-configuration)
 - [🛠️ Manual Step-by-Step Installation Reference (Ubuntu 24.04 / v15 / v16)](#️-manual-step-by-step-installation-reference-ubuntu-2404--v15--v16)
@@ -98,7 +99,8 @@ chmod +x create_erpnext_lxc.sh
 | :--- | :--- |
 | **Multi-Version Support** | Seamlessly deploy **ERPNext v15** (LTS Recommended), **v16** (develop / next-gen), **v14**, or **v13**. |
 | **Ubuntu 24.04 (PEP 668) Ready** | Utilizes Astral **`uv`** to install isolated Python versions (3.11 for v14/v15, **3.14 for v16/develop**, 3.10 for v13), completely eliminating Ubuntu 24.04 pip restriction errors. |
-| **Checkpoint & Resume Engine** | Automatically tracks completed stages in an persistent state file. If installation is interrupted or an error occurs, re-running the script offers to resume immediately from the exact failure point without re-prompting or starting over. |
+| **Safe Cleanup & Uninstaller** | Dedicated uninstaller (`--cleanup-only` / `--clean-install`) stops supervisor services, cleans Nginx configs, and purges only Frappe databases/benches while strictly preserving existing websites and production databases. |
+| **Checkpoint & Resume Engine** | Automatically tracks completed stages in a persistent state file. If installation is interrupted or an error occurs, re-running the script offers to resume immediately from the exact failure point without re-prompting or starting over. |
 | **Coexistence Mode** | Installs cleanly alongside existing websites (WordPress, Node.js, PHP, ShopSuite) without overwriting databases or port 80/443 configurations. |
 | **Multi-App Installer** | Bundle **ERPNext, HRMS, Payments, Webshop, Helpdesk, Frappe CRM**, or any custom private Git repository in one run. |
 | **Complete SSL Stack** | Automated **Let's Encrypt** with auto-renewal, **Cloudflare Real-IP proxy integration**, Self-Signed SSL, or HTTP mode. |
@@ -135,6 +137,9 @@ sudo bash install.sh \
 | `--non-interactive`, `-y` | Flag | `false` | Run without interactive prompts |
 | `--resume` | Flag | `false` | Resume interrupted installation from previous checkpoint |
 | `--clean` | Flag | `false` | Discard previous checkpoint and start fresh |
+| `--cleanup-only`, `--uninstall` | Flag | `false` | Safely remove existing Frappe bench, supervisor services, Nginx configs, and Frappe databases |
+| `--clean-install` | Flag | `false` | Purge any old Frappe bench installation before performing a clean install |
+| `--force`, `-f` | Flag | `false` | Force cleanup operations without interactive confirmation |
 | `--mode` | `fresh` \| `existing` | `fresh` | Installation mode (fresh VPS vs. existing server) |
 | `--version` | `14` \| `15` \| `16` \| `13` | `15` | Target Frappe / ERPNext version |
 | `--domain` | `<domain.com>` \| `<IP>` | Host IP | Server domain name or public IP |
@@ -152,6 +157,32 @@ sudo bash install.sh \
 | `--ufw` | Flag | `false` | Automatically configure and enable UFW firewall |
 | `--no-cron` | Flag | `false` | Disable automated 02:00 AM database backup cron |
 | `--help`, `-h` | Flag | - | Display help menu and CLI usage |
+
+---
+
+## 🧹 Old Installation Cleanup & Uninstaller
+
+If you have a broken, partial, or old Frappe/ERPNext installation, the installer provides a safe, integrated cleanup engine:
+- **Service Termination**: Stops all Frappe supervisor worker and socket processes.
+- **Supervisor Clean**: Removes `/etc/supervisor/conf.d/frappe-bench.conf` and reloads supervisor.
+- **Nginx Clean**: Unlinks `/etc/nginx/conf.d/frappe-bench.conf` and reloads Nginx safely, preserving all non-Frappe websites.
+- **Database Safety Guard**: Inspects `site_config.json` and drops **only** Frappe databases and users. It **strictly protects** system and third-party databases (such as `shopsuite`, `aranya_erp`, `mysql`).
+- **Bench Cleanup**: Removes the bench directory (`/home/<user>/frappe-bench`) and automated backup crons.
+
+### Running Standalone Cleanup
+```bash
+# Interactive mode (asks for confirmation)
+sudo bash install.sh --cleanup-only
+
+# Automated / non-interactive mode
+sudo bash install.sh --cleanup-only --force --user erp --db-pass "YourDbPassword"
+```
+
+### Performing a Fresh Clean Install
+To completely purge an old installation and immediately proceed with a fresh installation:
+```bash
+sudo bash install.sh --clean-install
+```
 
 ---
 

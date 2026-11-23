@@ -168,7 +168,187 @@ clear_state() {
     rm -f "$STATE_FILE"
 }
 
+# ------------------------------------------------------------------------------
+# Old Installation Cleanup & Uninstaller System
+# ------------------------------------------------------------------------------
+is_db_safe_to_drop() {
+    local db="$1"
+    [ -z "$db" ] && return 1
+    # Safeguard list of protected databases - NEVER DROP THESE
+    case "$db" in
+        information_schema|mysql|performance_schema|sys|shopsuite|aranya_erp)
+            return 1 ;;
+    esac
+    # Must only contain alphanumeric and underscore
+    if [[ ! "$db" =~ ^[a-zA-Z0-9_]+$ ]]; then
+        return 1
+    fi
+    return 0
+}
+
+cleanup_old_installation() {
+    local force_flag="${1:-false}"
+
+    echo -e "\n${YELLOW}${BOLD}================================================================${NC}"
+    echo -e "${YELLOW}${BOLD}        FRAPPE & ERPNEXT INSTALLATION CLEANUP SYSTEM             ${NC}"
+    echo -e "${YELLOW}${BOLD}================================================================${NC}"
+    echo -e "This will safely clean up and uninstall previous Frappe / ERPNext components:"
+    echo -e "  • Stop Frappe Supervisor processes & remove supervisor configurations"
+    echo -e "  • Remove Frappe Nginx site configuration & reload Nginx"
+    echo -e "  • Safely drop associated Frappe site databases (strictly excludes protected DBs)"
+    echo -e "  • Remove Frappe Bench directory (~/${BENCH_NAME:-frappe-bench})"
+    echo -e "  • Remove Frappe automated backup cron jobs"
+    echo -e "  • Clear installer state checkpoints and temporary files"
+    echo -e "${RED}${BOLD}  Note: Protected databases ('shopsuite', 'aranya_erp', system DBs)${NC}"
+    echo -e "${RED}${BOLD}        and non-Frappe Nginx sites will NEVER be touched.${NC}"
+    echo -e "${YELLOW}================================================================${NC}\n"
+
+    if [ "$force_flag" != "true" ] && [ "$NON_INTERACTIVE" = false ]; then
+        local confirm_clean
+        confirm_clean=$(prompt_with_default "Are you sure you want to clean up the previous installation? [y/N]" "n")
+        if [[ ! "$confirm_clean" =~ ^[Yy]$ ]]; then
+            msg_info "Cleanup operation aborted by user."
+            return 0
+        fi
+    fi
+
+    msg_info "Starting cleanup of old Frappe / ERPNext installation..."
+
+    # Detect target bench user and bench path
+    local target_user="${BENCH_USER:-}"
+    if [ -z "$target_user" ]; then
+        if [ -L /etc/supervisor/conf.d/frappe-bench.conf ]; then
+            local sup_target
+            sup_target=$(readlink -f /etc/supervisor/conf.d/frappe-bench.conf 2>/dev/null || true)
+            target_user=$(echo "$sup_target" | cut -d'/' -f3)
+        fi
+    fi
+    if [ -z "$target_user" ]; then
+        if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+            target_user="$SUDO_USER"
+        else
+            target_user="frappe"
+        fi
+    fi
+
+    local user_home
+    user_home=$(eval echo "~$target_user" 2>/dev/null || echo "/home/$target_user")
+    local bench_path="${user_home}/${BENCH_NAME:-frappe-bench}"
+
+    msg_info "Target user: ${BOLD}${target_user}${NC} | Bench path: ${BOLD}${bench_path}${NC}"
+
+    # 1. Stop and remove Supervisor processes
+    msg_info "1. Stopping Frappe supervisor processes and removing configs..."
+    if command -v supervisorctl >/dev/null 2>&1; then
+        supervisorctl stop "${BENCH_NAME:-frappe-bench}:*" >> "$LOG_FILE" 2>&1 || true
+        supervisorctl stop frappe-bench:* >> "$LOG_FILE" 2>&1 || true
+    fi
+    rm -f /etc/supervisor/conf.d/frappe-bench.conf
+    rm -f /etc/supervisor/conf.d/*frappe*.conf
+    if command -v supervisorctl >/dev/null 2>&1; then
+        supervisorctl reread >> "$LOG_FILE" 2>&1 || true
+        supervisorctl update >> "$LOG_FILE" 2>&1 || true
+    fi
+
+    # 2. Remove Frappe Nginx configs safely and test/reload
+    msg_info "2. Removing Frappe Nginx configs and reloading web server..."
+    rm -f /etc/nginx/conf.d/frappe-bench.conf
+    rm -f /etc/nginx/conf.d/*frappe*.conf
+    rm -f /etc/nginx/sites-enabled/frappe-bench.conf
+    if command -v nginx >/dev/null 2>&1; then
+        if nginx -t >> "$LOG_FILE" 2>&1; then
+            systemctl reload nginx >> "$LOG_FILE" 2>&1 || true
+            msg_success "Nginx successfully reloaded. Coexisting sites remain active."
+        else
+            msg_warn "Nginx configuration notice. Preserving existing configs."
+        fi
+    fi
+
+    # 3. Clean up MariaDB site databases and users safely
+    msg_info "3. Inspecting and removing Frappe site databases..."
+    local mysql_auth=""
+    if [ -n "$DB_ROOT_PASS" ]; then
+        mysql_auth="-u root -p${DB_ROOT_PASS}"
+    elif mysql -u root -e "SELECT 1;" >/dev/null 2>&1; then
+        mysql_auth="-u root"
+    fi
+
+    local dbs_to_drop=()
+
+    # Extract db_name from site_config.json files in bench
+    if [ -d "${bench_path}/sites" ]; then
+        for sc in "${bench_path}"/sites/*/site_config.json; do
+            if [ -f "$sc" ]; then
+                local s_db
+                s_db=$(grep -o '"db_name"[^,]*' "$sc" 2>/dev/null | cut -d'"' -f4 || true)
+                if [ -n "$s_db" ] && is_db_safe_to_drop "$s_db"; then
+                    dbs_to_drop+=("$s_db")
+                fi
+            fi
+        done
+    fi
+
+    # If mysql_auth is available, also search for any Frappe site databases matching `^_`
+    if [ -n "$mysql_auth" ]; then
+        local raw_dbs
+        raw_dbs=$(mysql $mysql_auth -N -e "SHOW DATABASES;" 2>/dev/null || true)
+        for db in $raw_dbs; do
+            if [[ "$db" =~ ^_[0-9a-f]{16}$ ]] && is_db_safe_to_drop "$db"; then
+                dbs_to_drop+=("$db")
+            fi
+        done
+    fi
+
+    if [ ${#dbs_to_drop[@]} -gt 0 ]; then
+        local unique_dbs
+        unique_dbs=($(printf "%s\n" "${dbs_to_drop[@]}" | sort -u))
+        for db in "${unique_dbs[@]}"; do
+            if is_db_safe_to_drop "$db"; then
+                if [ -n "$mysql_auth" ]; then
+                    msg_info "Safely dropping Frappe site database and user: ${BOLD}${db}${NC}..."
+                    mysql $mysql_auth -e "DROP DATABASE IF EXISTS \`${db}\`;" >> "$LOG_FILE" 2>&1 || true
+                    mysql $mysql_auth -e "DROP USER IF EXISTS '${db}'@'%';" >> "$LOG_FILE" 2>&1 || true
+                    mysql $mysql_auth -e "DROP USER IF EXISTS '${db}'@'localhost';" >> "$LOG_FILE" 2>&1 || true
+                    mysql $mysql_auth -e "FLUSH PRIVILEGES;" >> "$LOG_FILE" 2>&1 || true
+                    msg_success "Dropped database '${db}'."
+                else
+                    msg_warn "MariaDB credentials not provided. Database '${db}' was not dropped automatically."
+                fi
+            fi
+        done
+    else
+        msg_info "No Frappe site databases found to drop."
+    fi
+
+    # 4. Remove automated backup cron jobs
+    msg_info "4. Removing Frappe cron jobs..."
+    rm -f /etc/cron.d/frappe_backup_*
+
+    # 5. Remove Bench directory
+    if [ -d "$bench_path" ]; then
+        msg_info "5. Removing Bench directory: ${bench_path}..."
+        rm -rf "$bench_path"
+        msg_success "Bench directory removed."
+    else
+        msg_info "5. Bench directory not present: ${bench_path}"
+    fi
+
+    # 6. Clear installer checkpoint state
+    msg_info "6. Clearing installer state checkpoints..."
+    clear_state
+    rm -f /var/log/frappe-installer/install_state.env /tmp/frappe_install_state.env
+
+    msg_success "Cleanup completed successfully!"
+    echo -e "${GREEN}${BOLD}Previous Frappe / ERPNext installation has been cleanly purged.${NC}\n"
+}
+
 check_resume_option() {
+    if [ "$FORCE_CLEANUP_FIRST" = true ]; then
+        msg_info "Clean-install requested. Purging previous Frappe installation before starting..."
+        cleanup_old_installation true
+        return 0
+    fi
+
     if [ "$FORCE_CLEAN" = true ]; then
         msg_info "Clean flag specified. Purging previous installation checkpoint..."
         clear_state
@@ -186,11 +366,21 @@ check_resume_option() {
                 if [ "$NON_INTERACTIVE" = false ]; then
                     echo -e "\n${YELLOW}${BOLD}[NOTICE] A completed installation was found in state history:${NC}"
                     echo -e "  Site: ${prev_site} | Version: ${prev_version} | User: ${prev_user}"
-                    local start_fresh
-                    start_fresh=$(prompt_with_default "Start a completely new installation? [Y/n]" "y")
-                    if [[ "$start_fresh" =~ ^[Yy]$ ]]; then
+                    echo -e "  1) Keep existing and exit"
+                    echo -e "  2) Clean up / Uninstall old installation and start fresh"
+                    echo -e "  3) Start fresh without cleaning up old bench"
+                    local post_choice
+                    post_choice=$(prompt_with_default "Select option [1-3]" "1")
+                    if [ "$post_choice" == "2" ]; then
+                        cleanup_old_installation true
                         clear_state
                         return 0
+                    elif [ "$post_choice" == "3" ]; then
+                        clear_state
+                        return 0
+                    else
+                        msg_info "Exiting."
+                        exit 0
                     fi
                 fi
                 return 0
@@ -218,13 +408,18 @@ check_resume_option() {
             else
                 echo -e "How would you like to proceed?"
                 echo -e "  ${GREEN}1) Resume installation from where it stopped (Recommended)${NC}"
-                echo -e "  2) Discard previous state and start fresh"
+                echo -e "  2) Clean up old installation completely and start fresh"
+                echo -e "  3) Discard previous state and start fresh without cleanup"
                 local resume_choice
-                resume_choice=$(prompt_with_default "Select option [1-2]" "1")
+                resume_choice=$(prompt_with_default "Select option [1-3]" "1")
                 if [ "$resume_choice" == "1" ]; then
                     RESUME_MODE=true
                     load_state_vars
                     msg_info "Resuming installation with saved parameters."
+                    return 0
+                elif [ "$resume_choice" == "2" ]; then
+                    cleanup_old_installation true
+                    clear_state
                     return 0
                 else
                     msg_info "Discarding previous state. Starting fresh..."
@@ -250,6 +445,9 @@ get_target_python_version() {
 # Default Variables
 # ------------------------------------------------------------------------------
 NON_INTERACTIVE=false
+RUN_CLEANUP_ONLY=false
+FORCE_CLEANUP_FIRST=false
+FORCE_FLAG=false
 INSTALL_MODE="fresh"        # "fresh" or "existing"
 ERP_VERSION="version-15"    # "version-14", "version-15", "version-16", "develop"
 DOMAIN_TYPE="domain"        # "domain" or "local"
@@ -414,6 +612,33 @@ detect_services() {
 # Interactive Wizard
 # ------------------------------------------------------------------------------
 run_interactive_wizard() {
+    # Check if an existing bench directory or supervisor config exists
+    local check_bench_user="${SUDO_USER:-frappe}"
+    local check_bench_home
+    check_bench_home=$(eval echo "~$check_bench_user" 2>/dev/null || echo "/home/$check_bench_user")
+    if [ -d "${check_bench_home}/frappe-bench" ] || [ -f /etc/supervisor/conf.d/frappe-bench.conf ]; then
+        echo -e "\n${YELLOW}${BOLD}================================================================${NC}"
+        echo -e "${YELLOW}${BOLD}       ⚠️  EXISTING FRAPPE BENCH DETECTED ON SERVER ⚠️           ${NC}"
+        echo -e "${YELLOW}${BOLD}================================================================${NC}"
+        echo -e "Found existing installation at: ${BOLD}${check_bench_home}/frappe-bench${NC}"
+        echo "Would you like to:"
+        echo -e "  ${GREEN}1) Clean up / Purge old installation and start fresh (Recommended)${NC}"
+        echo "  2) Coexist with existing installation (Preserve old bench, configure side-by-side)"
+        echo "  3) Exit installer"
+        local exist_choice
+        exist_choice=$(prompt_with_default "Select option [1-3]" "1")
+        if [ "$exist_choice" == "1" ]; then
+            cleanup_old_installation false
+            INSTALL_MODE="fresh"
+        elif [ "$exist_choice" == "2" ]; then
+            INSTALL_MODE="existing"
+        else
+            msg_info "Installation cancelled by user."
+            exit 0
+        fi
+        echo ""
+    fi
+
     echo -e "${BOLD}${MAGENTA}--- STEP 1: Installation Mode ---${NC}"
     echo "1) Fresh Installation (Default - cleans/configures new environment, sets up MariaDB, Nginx, Redis)"
     echo "2) Coexist With Existing Services (Safe mode - preserves existing DBs, asks for root password, avoids port conflicts)"
@@ -734,9 +959,11 @@ setup_nodejs_and_yarn() {
     fi
 
     msg_info "Configuring Node.js and Yarn..."
-    local node_ver="20"
+    local target_node="20"
     if [ "$ERP_VERSION" == "version-13" ] || [ "$ERP_VERSION" == "version-14" ]; then
-        node_ver="18"
+        target_node="18"
+    elif [ "$ERP_VERSION" == "version-16" ] || [ "$ERP_VERSION" == "develop" ]; then
+        target_node="24"
     fi
 
     # Check if modern node is already installed
@@ -745,16 +972,27 @@ setup_nodejs_and_yarn() {
         current_node=$(node -v | cut -d'.' -f1 | tr -d 'v')
     fi
 
-    if [ -z "$current_node" ] || [ "$current_node" -lt 18 ]; then
-        msg_info "Installing Node.js ${node_ver}.x from NodeSource..."
-        curl -fsSL "https://deb.nodesource.com/setup_${node_ver}.x" | bash - >> "$LOG_FILE" 2>&1
-        apt-get install -y nodejs >> "$LOG_FILE" 2>&1
+    if [ -z "$current_node" ] || [ "$current_node" -lt "$target_node" ]; then
+        msg_info "Installing Node.js ${target_node}.x from NodeSource..."
+        export DEBIAN_FRONTEND=noninteractive
+        export NEEDRESTART_MODE=a
+        curl -fsSL "https://deb.nodesource.com/setup_${target_node}.x" | bash - >> "$LOG_FILE" 2>&1
+        apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nodejs >> "$LOG_FILE" 2>&1
     fi
 
     if ! command -v yarn >/dev/null 2>&1; then
         msg_info "Installing Yarn package manager..."
         npm install -g yarn >> "$LOG_FILE" 2>&1
     fi
+
+    # Enforce ignore-engines and extended network-timeout globally and for bench user
+    yarn config set ignore-engines true >> "$LOG_FILE" 2>&1 || true
+    yarn config set network-timeout 600000 >> "$LOG_FILE" 2>&1 || true
+    if [ -n "$BENCH_USER" ] && id -u "$BENCH_USER" >/dev/null 2>&1; then
+        sudo -u "$BENCH_USER" yarn config set ignore-engines true >> "$LOG_FILE" 2>&1 || true
+        sudo -u "$BENCH_USER" yarn config set network-timeout 600000 >> "$LOG_FILE" 2>&1 || true
+    fi
+
     msg_success "Node.js $(node -v) and Yarn $(yarn -v) ready."
     mark_stage_done "STAGE_NODEJS"
 }
@@ -944,7 +1182,14 @@ initialize_bench() {
     # Check if bench directory exists but is incomplete or broken
     if [ -d "$bench_path" ]; then
         if [ -f "${bench_path}/env/bin/python" ] && [ -d "${bench_path}/apps/frappe" ]; then
-            msg_info "Valid Frappe Bench already found at '${bench_path}'. Skipping 'bench init'..."
+            msg_info "Valid Frappe Bench already found at '${bench_path}'. Ensuring assets are compiled..."
+            sudo -u "$BENCH_USER" bash -c "
+                export PATH=\"${user_home}/.local/bin:/usr/local/bin:/usr/bin:\$PATH\"
+                cd \"${bench_path}\"
+                yarn config set ignore-engines true 2>/dev/null || true
+                yarn config set network-timeout 600000 2>/dev/null || true
+                bench build || true
+            " >> "$LOG_FILE" 2>&1
             mark_stage_done "STAGE_BENCH_INIT"
             return 0
         else
@@ -963,11 +1208,23 @@ initialize_bench() {
         export PATH=\"${user_home}/.local/bin:/usr/local/bin:/usr/bin:\$PATH\"
         cd \"${user_home}\"
         
+        # Ensure yarn ignores engine warnings/blocks and has high network timeout
+        yarn config set ignore-engines true 2>/dev/null || true
+        yarn config set network-timeout 600000 2>/dev/null || true
+        
         # Find exact python path for target version
         PY_PATH=\$(uv python find ${target_py} 2>/dev/null || which python3)
         echo \"[bench init] Executing with Python binary: \$PY_PATH (\$(${PY_PATH} --version 2>/dev/null || true))\"
         
-        bench init --frappe-branch \"${ERP_VERSION}\" --python \"\$PY_PATH\" \"${BENCH_NAME}\"
+        # Use --skip-assets to decouple asset compilation from bench initialization, preventing rollback crashes
+        echo \"n\" | bench init --skip-assets --frappe-branch \"${ERP_VERSION}\" --python \"\$PY_PATH\" \"${BENCH_NAME}\" </dev/null
+        
+        # Build assets cleanly with retry resilience
+        cd \"${bench_path}\"
+        bench build || {
+            echo '[bench build] Initial build attempt encountered an issue, retrying with cached packages...'
+            bench build
+        }
     " >> "$LOG_FILE" 2>&1
 
     # Ensure bench directory is readable for Nginx
@@ -1072,6 +1329,10 @@ install_frappe_apps() {
 
     for app in "${SELECTED_APPS[@]}"; do
         if [ "$app" == "erpnext" ]; then
+            # ERPNext requires payments app to be available in bench
+            if [ ! -d "${bench_path}/apps/payments" ]; then
+                install_single_app "payments" "$app_branch" || true
+            fi
             install_single_app "erpnext" "$app_branch"
         fi
     done
@@ -1140,6 +1401,11 @@ configure_production() {
         bench setup nginx --yes
         bench setup supervisor --yes
     " >> "$LOG_FILE" 2>&1
+
+    # If custom HTTP port is set, ensure generated nginx config listens on HTTP_PORT
+    if [ "$HTTP_PORT" != "80" ] && [ -f "${bench_path}/config/nginx.conf" ]; then
+        sed -i "s/listen 80;/listen ${HTTP_PORT};/g; s/listen \\[::\\]:80;/listen \\[::\\]:${HTTP_PORT};/g" "${bench_path}/config/nginx.conf"
+    fi
 
     # Ensure log format 'main' is defined for Debian/Ubuntu Nginx
     if [ ! -f /etc/nginx/conf.d/00-frappe-log-format.conf ]; then
@@ -1456,6 +1722,19 @@ parse_cli_arguments() {
                 FORCE_CLEAN=true
                 shift
                 ;;
+            --clean-install)
+                FORCE_CLEANUP_FIRST=true
+                FORCE_CLEAN=true
+                shift
+                ;;
+            --cleanup-only|--uninstall|--purge)
+                RUN_CLEANUP_ONLY=true
+                shift
+                ;;
+            --force|-f)
+                FORCE_FLAG=true
+                shift
+                ;;
             --no-cron)
                 ENABLE_BACKUP_CRON=false
                 shift
@@ -1467,6 +1746,9 @@ parse_cli_arguments() {
                 echo "  --non-interactive, -y   Run non-interactively without prompting"
                 echo "  --resume                Resume interrupted installation from checkpoint"
                 echo "  --clean                 Discard previous checkpoint and start fresh"
+                echo "  --clean-install         Safely purge previous Frappe installation before installing fresh"
+                echo "  --cleanup-only          Safely uninstall and clean up previous Frappe bench and configs"
+                echo "  --force, -f             Bypass confirmation prompts during cleanup"
                 echo "  --mode <fresh|existing> Installation mode (default: fresh)"
                 echo "  --version <14|15|16>    ERPNext version (default: 15)"
                 echo "  --domain <domain.com>   Domain name or server IP"
@@ -1513,6 +1795,12 @@ main() {
     detect_services
 
     parse_cli_arguments "$@"
+
+    # Execute cleanup-only if requested
+    if [ "$RUN_CLEANUP_ONLY" = true ]; then
+        cleanup_old_installation "$FORCE_FLAG"
+        exit 0
+    fi
 
     # Check for previous installation progress and offer resume
     check_resume_option
