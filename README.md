@@ -97,7 +97,8 @@ chmod +x create_erpnext_lxc.sh
 | Feature | Description |
 | :--- | :--- |
 | **Multi-Version Support** | Seamlessly deploy **ERPNext v15** (LTS Recommended), **v16** (develop / next-gen), **v14**, or **v13**. |
-| **Ubuntu 24.04 (PEP 668) Ready** | Utilizes Astral **`uv`** to install isolated Python versions (3.11 for v15, 3.12 for v16), completely eliminating Ubuntu 24.04 pip restriction errors. |
+| **Ubuntu 24.04 (PEP 668) Ready** | Utilizes Astral **`uv`** to install isolated Python versions (3.11 for v14/v15, **3.14 for v16/develop**, 3.10 for v13), completely eliminating Ubuntu 24.04 pip restriction errors. |
+| **Checkpoint & Resume Engine** | Automatically tracks completed stages in an persistent state file. If installation is interrupted or an error occurs, re-running the script offers to resume immediately from the exact failure point without re-prompting or starting over. |
 | **Coexistence Mode** | Installs cleanly alongside existing websites (WordPress, Node.js, PHP, ShopSuite) without overwriting databases or port 80/443 configurations. |
 | **Multi-App Installer** | Bundle **ERPNext, HRMS, Payments, Webshop, Helpdesk, Frappe CRM**, or any custom private Git repository in one run. |
 | **Complete SSL Stack** | Automated **Let's Encrypt** with auto-renewal, **Cloudflare Real-IP proxy integration**, Self-Signed SSL, or HTTP mode. |
@@ -132,6 +133,8 @@ sudo bash install.sh \
 | Flag | Parameter / Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `--non-interactive`, `-y` | Flag | `false` | Run without interactive prompts |
+| `--resume` | Flag | `false` | Resume interrupted installation from previous checkpoint |
+| `--clean` | Flag | `false` | Discard previous checkpoint and start fresh |
 | `--mode` | `fresh` \| `existing` | `fresh` | Installation mode (fresh VPS vs. existing server) |
 | `--version` | `14` \| `15` \| `16` \| `13` | `15` | Target Frappe / ERPNext version |
 | `--domain` | `<domain.com>` \| `<IP>` | Host IP | Server domain name or public IP |
@@ -316,6 +319,17 @@ sudo systemctl reload nginx
 
 ### Q4: Can I run ERPNext on a port other than 80?
 **Answer:** Yes! Use `--port 8088` (or any custom port) to run ERPNext side-by-side with other websites on the same server.
+
+### Q5: How does the Resume Feature work if my installation is interrupted?
+**Answer:** The installer saves your configuration parameters and checkpoint states into `/var/log/frappe-installer/install_state.env`. If a run is interrupted or fails (e.g. network disconnect, power loss), simply re-running `sudo bash install.sh` prompts:
+```text
+  1) Resume installation from where it stopped (Recommended)
+  2) Discard previous state and start fresh
+```
+In non-interactive scripts or automation, use `--resume` to continue or `--clean` to wipe state.
+
+### Q6: Why does Frappe / ERPNext v16 fail on older Python versions?
+**Answer:** Upstream Frappe Framework `version-16` and `develop` branches enforce `requires-python = ">=3.14,<3.15"`. Attempting to initialize with Python 3.11 or 3.12 fails with dependency resolution errors. Our installer automatically identifies this and provisions isolated **Python 3.14** via Astral `uv` for version-16.
 
 ---
 

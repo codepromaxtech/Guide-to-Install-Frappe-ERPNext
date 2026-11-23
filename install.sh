@@ -88,11 +88,163 @@ cleanup_on_error() {
     echo -e "${RED}Error on line $line: command '${cmd}' exited with status $code.${NC}"
     echo -e "${YELLOW}Detailed execution logs are available at:${NC}"
     echo -e "  ${BOLD}${LOG_FILE}${NC}\n"
+    if [ -f "${STATE_FILE:-}" ]; then
+        echo -e "${CYAN}${BOLD}[RESUME READY]${NC} State has been preserved in: ${BOLD}${STATE_FILE}${NC}"
+        echo -e "After resolving any issues, run ${BOLD}sudo bash install.sh${NC} to resume from this checkpoint!\n"
+    fi
     echo -e "To view the last 30 lines of the log file:"
     echo -e "  ${CYAN}tail -n 30 ${LOG_FILE}${NC}\n"
     exit "$code"
 }
 trap 'cleanup_on_error $LINENO "$BASH_COMMAND" $?' ERR
+
+# ------------------------------------------------------------------------------
+# State Tracking & Resume Management
+# ------------------------------------------------------------------------------
+STATE_FILE="${LOG_DIR}/install_state.env"
+[ ! -w "$(dirname "$STATE_FILE" 2>/dev/null)" ] 2>/dev/null && STATE_FILE="/tmp/frappe_install_state.env"
+RESUME_MODE=false
+FORCE_CLEAN=false
+
+save_state_var() {
+    local var_name="$1"
+    local var_val="$2"
+    touch "$STATE_FILE" 2>/dev/null || return 0
+    if grep -q "^${var_name}=" "$STATE_FILE" 2>/dev/null; then
+        sed -i "s|^${var_name}=.*|${var_name}=\"${var_val}\"|" "$STATE_FILE"
+    else
+        echo "${var_name}=\"${var_val}\"" >> "$STATE_FILE"
+    fi
+}
+
+save_all_state_vars() {
+    save_state_var "NON_INTERACTIVE" "$NON_INTERACTIVE"
+    save_state_var "INSTALL_MODE" "$INSTALL_MODE"
+    save_state_var "ERP_VERSION" "$ERP_VERSION"
+    save_state_var "DOMAIN_NAME" "$DOMAIN_NAME"
+    save_state_var "DOMAIN_TYPE" "$DOMAIN_TYPE"
+    save_state_var "SITE_NAME" "$SITE_NAME"
+    save_state_var "HTTP_PORT" "$HTTP_PORT"
+    save_state_var "SSL_TYPE" "$SSL_TYPE"
+    save_state_var "CF_MODE" "$CF_MODE"
+    save_state_var "BENCH_USER" "$BENCH_USER"
+    save_state_var "BENCH_NAME" "$BENCH_NAME"
+    save_state_var "ADMIN_PASS" "$ADMIN_PASS"
+    save_state_var "DB_ROOT_PASS" "$DB_ROOT_PASS"
+    save_state_var "ADMIN_EMAIL" "$ADMIN_EMAIL"
+    save_state_var "SAVED_APPS" "${SELECTED_APPS[*]}"
+    save_state_var "CUSTOM_APP_URL" "$CUSTOM_APP_URL"
+    save_state_var "CUSTOM_APP_BRANCH" "$CUSTOM_APP_BRANCH"
+    save_state_var "ENABLE_UFW" "$ENABLE_UFW"
+    save_state_var "ENABLE_BACKUP_CRON" "$ENABLE_BACKUP_CRON"
+}
+
+load_state_vars() {
+    if [ -f "$STATE_FILE" ]; then
+        # shellcheck disable=SC1090
+        source "$STATE_FILE"
+        if [ -n "${SAVED_APPS:-}" ]; then
+            read -r -a SELECTED_APPS <<< "$SAVED_APPS"
+        fi
+    fi
+}
+
+mark_stage_done() {
+    local stage="$1"
+    save_state_var "${stage}" "done"
+    log "STATE" "Stage ${stage} marked as completed."
+}
+
+is_stage_done() {
+    local stage="$1"
+    if [ -f "$STATE_FILE" ]; then
+        grep -q "^${stage}=\"done\"" "$STATE_FILE" 2>/dev/null
+        return $?
+    fi
+    return 1
+}
+
+clear_state() {
+    rm -f "$STATE_FILE"
+}
+
+check_resume_option() {
+    if [ "$FORCE_CLEAN" = true ]; then
+        msg_info "Clean flag specified. Purging previous installation checkpoint..."
+        clear_state
+        return 0
+    fi
+
+    if [ -f "$STATE_FILE" ]; then
+        local prev_site prev_version prev_user
+        prev_site=$(grep '^SITE_NAME=' "$STATE_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+        prev_version=$(grep '^ERP_VERSION=' "$STATE_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+        prev_user=$(grep '^BENCH_USER=' "$STATE_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+
+        if [ -n "$prev_site" ] || [ -n "$prev_version" ]; then
+            if is_stage_done "STAGE_COMPLETED"; then
+                if [ "$NON_INTERACTIVE" = false ]; then
+                    echo -e "\n${YELLOW}${BOLD}[NOTICE] A completed installation was found in state history:${NC}"
+                    echo -e "  Site: ${prev_site} | Version: ${prev_version} | User: ${prev_user}"
+                    local start_fresh
+                    start_fresh=$(prompt_with_default "Start a completely new installation? [Y/n]" "y")
+                    if [[ "$start_fresh" =~ ^[Yy]$ ]]; then
+                        clear_state
+                        return 0
+                    fi
+                fi
+                return 0
+            fi
+
+            # Incomplete previous installation found
+            echo -e "\n${YELLOW}${BOLD}================================================================${NC}"
+            echo -e "${YELLOW}${BOLD}       ⚠️  PREVIOUS INCOMPLETE INSTALLATION DETECTED ⚠️          ${NC}"
+            echo -e "${YELLOW}${BOLD}================================================================${NC}"
+            echo -e "  Target User    : ${BOLD}${prev_user:-unknown}${NC}"
+            echo -e "  Target Site    : ${BOLD}${prev_site:-unknown}${NC}"
+            echo -e "  ERP Version    : ${BOLD}${prev_version:-unknown}${NC}"
+            echo -e "${YELLOW}----------------------------------------------------------------${NC}"
+
+            if [ "$NON_INTERACTIVE" = true ]; then
+                if [ "$RESUME_MODE" = true ]; then
+                    msg_info "Non-interactive mode: Resuming previous installation from state checkpoint..."
+                    load_state_vars
+                    return 0
+                else
+                    msg_info "Non-interactive mode without --resume: Cleaning state and starting fresh..."
+                    clear_state
+                    return 0
+                fi
+            else
+                echo -e "How would you like to proceed?"
+                echo -e "  ${GREEN}1) Resume installation from where it stopped (Recommended)${NC}"
+                echo -e "  2) Discard previous state and start fresh"
+                local resume_choice
+                resume_choice=$(prompt_with_default "Select option [1-2]" "1")
+                if [ "$resume_choice" == "1" ]; then
+                    RESUME_MODE=true
+                    load_state_vars
+                    msg_info "Resuming installation with saved parameters."
+                    return 0
+                else
+                    msg_info "Discarding previous state. Starting fresh..."
+                    clear_state
+                    return 0
+                fi
+            fi
+        fi
+    fi
+}
+
+get_target_python_version() {
+    case "$ERP_VERSION" in
+        "version-13") echo "3.10" ;;
+        "version-14") echo "3.11" ;;
+        "version-15") echo "3.11" ;;
+        "version-16"|"develop") echo "3.14" ;;
+        *) echo "3.11" ;;
+    esac
+}
 
 # ------------------------------------------------------------------------------
 # Default Variables
@@ -472,6 +624,11 @@ print_summary_confirmation() {
 # System Preparation & Dependencies
 # ------------------------------------------------------------------------------
 setup_swap() {
+    if is_stage_done "STAGE_SWAP"; then
+        msg_info "Swap space already configured. Skipping..."
+        return 0
+    fi
+
     local total_ram_mb
     total_ram_mb=$(free -m | awk '/^Mem:/{print $2}')
     if [ "$total_ram_mb" -lt 2500 ]; then
@@ -489,9 +646,15 @@ setup_swap() {
             msg_info "Swap space already exists."
         fi
     fi
+    mark_stage_done "STAGE_SWAP"
 }
 
 install_system_packages() {
+    if is_stage_done "STAGE_PACKAGES"; then
+        msg_info "System packages already installed. Skipping..."
+        return 0
+    fi
+
     msg_info "Updating system package repositories..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >> "$LOG_FILE" 2>&1
@@ -507,12 +670,18 @@ install_system_packages() {
         python3-venv pipx >> "$LOG_FILE" 2>&1
 
     msg_success "Core system packages installed."
+    mark_stage_done "STAGE_PACKAGES"
 }
 
 # ------------------------------------------------------------------------------
 # Python & UV Setup
 # ------------------------------------------------------------------------------
 setup_python_and_uv() {
+    if is_stage_done "STAGE_PYTHON"; then
+        msg_info "Python environment already configured. Skipping..."
+        return 0
+    fi
+
     msg_info "Configuring Python environment with uv..."
     local user_home
     user_home=$(eval echo "~$BENCH_USER")
@@ -523,14 +692,9 @@ setup_python_and_uv() {
         sudo -u "$BENCH_USER" bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh' >> "$LOG_FILE" 2>&1
     fi
 
-    # Determine recommended Python version based on Frappe version
-    local target_py="3.11"
-    case "$ERP_VERSION" in
-        "version-13") target_py="3.10" ;;
-        "version-14") target_py="3.11" ;; # Frappe v14 requires Python 3.10/3.11
-        "version-15") target_py="3.11" ;; # Frappe v15 officially recommends 3.11 (supports 3.12)
-        "version-16"|"develop") target_py="3.12" ;; # Frappe v16 recommends 3.12 or 3.14
-    esac
+    # Determine recommended Python version dynamically
+    local target_py
+    target_py=$(get_target_python_version)
 
     msg_info "Ensuring Python ${target_py} is available for Frappe ${ERP_VERSION}..."
     sudo -u "$BENCH_USER" bash -c "
@@ -557,12 +721,18 @@ setup_python_and_uv() {
     fi
 
     msg_success "Python ${target_py} and frappe-bench installed successfully."
+    mark_stage_done "STAGE_PYTHON"
 }
 
 # ------------------------------------------------------------------------------
 # Node.js & Yarn Setup
 # ------------------------------------------------------------------------------
 setup_nodejs_and_yarn() {
+    if is_stage_done "STAGE_NODEJS"; then
+        msg_info "Node.js and Yarn already configured. Skipping..."
+        return 0
+    fi
+
     msg_info "Configuring Node.js and Yarn..."
     local node_ver="20"
     if [ "$ERP_VERSION" == "version-13" ] || [ "$ERP_VERSION" == "version-14" ]; then
@@ -586,15 +756,22 @@ setup_nodejs_and_yarn() {
         npm install -g yarn >> "$LOG_FILE" 2>&1
     fi
     msg_success "Node.js $(node -v) and Yarn $(yarn -v) ready."
+    mark_stage_done "STAGE_NODEJS"
 }
 
 # ------------------------------------------------------------------------------
 # wkhtmltopdf Setup
 # ------------------------------------------------------------------------------
 setup_wkhtmltopdf() {
+    if is_stage_done "STAGE_WKHTMLTOPDF"; then
+        msg_info "wkhtmltopdf already configured. Skipping..."
+        return 0
+    fi
+
     msg_info "Setting up wkhtmltopdf with Qt patched support..."
     if command -v wkhtmltopdf >/dev/null 2>&1; then
         msg_info "wkhtmltopdf is already installed: $(wkhtmltopdf --version | head -n1)"
+        mark_stage_done "STAGE_WKHTMLTOPDF"
         return 0
     fi
 
@@ -625,12 +802,18 @@ setup_wkhtmltopdf() {
     else
         msg_warn "Could not verify wkhtmltopdf installation. PDF printing might be degraded."
     fi
+    mark_stage_done "STAGE_WKHTMLTOPDF"
 }
 
 # ------------------------------------------------------------------------------
 # MariaDB Setup
 # ------------------------------------------------------------------------------
 setup_mariadb() {
+    if is_stage_done "STAGE_MARIADB"; then
+        msg_info "MariaDB already configured. Skipping..."
+        return 0
+    fi
+
     msg_info "Configuring MariaDB Server..."
 
     if [ "$INSTALL_MODE" == "fresh" ]; then
@@ -692,12 +875,18 @@ EOF
 
     systemctl restart mariadb || systemctl restart mysql
     msg_success "MariaDB configured with utf8mb4 and restarted."
+    mark_stage_done "STAGE_MARIADB"
 }
 
 # ------------------------------------------------------------------------------
 # Redis Setup
 # ------------------------------------------------------------------------------
 setup_redis() {
+    if is_stage_done "STAGE_REDIS"; then
+        msg_info "Redis already configured. Skipping..."
+        return 0
+    fi
+
     msg_info "Configuring Redis cache and queue server..."
     if ! command -v redis-server >/dev/null 2>&1; then
         apt-get install -y redis-server >> "$LOG_FILE" 2>&1
@@ -705,12 +894,18 @@ setup_redis() {
     systemctl start redis-server || systemctl start redis
     systemctl enable redis-server || systemctl enable redis
     msg_success "Redis server is running."
+    mark_stage_done "STAGE_REDIS"
 }
 
 # ------------------------------------------------------------------------------
 # Bench User & Directory Setup
 # ------------------------------------------------------------------------------
 setup_user() {
+    if is_stage_done "STAGE_USER"; then
+        msg_info "User '${BENCH_USER}' already configured. Skipping..."
+        return 0
+    fi
+
     if ! id -u "$BENCH_USER" >/dev/null 2>&1; then
         msg_info "Creating dedicated system user '${BENCH_USER}'..."
         useradd -m -s /bin/bash -G sudo "$BENCH_USER"
@@ -730,6 +925,7 @@ setup_user() {
     local user_home
     user_home=$(eval echo "~$BENCH_USER")
     chmod 755 "$user_home"
+    mark_stage_done "STAGE_USER"
 }
 
 # ------------------------------------------------------------------------------
@@ -740,20 +936,36 @@ initialize_bench() {
     user_home=$(eval echo "~$BENCH_USER")
     local bench_path="${user_home}/${BENCH_NAME}"
 
-    if [ -d "$bench_path" ]; then
-        msg_warn "Bench directory '${bench_path}' already exists. Skipping 'bench init'..."
+    if is_stage_done "STAGE_BENCH_INIT"; then
+        msg_info "Frappe Bench already initialized at '${bench_path}'. Skipping..."
         return 0
     fi
 
-    msg_info "Initializing Frappe Bench with branch '${ERP_VERSION}'..."
+    # Check if bench directory exists but is incomplete or broken
+    if [ -d "$bench_path" ]; then
+        if [ -f "${bench_path}/env/bin/python" ] && [ -d "${bench_path}/apps/frappe" ]; then
+            msg_info "Valid Frappe Bench already found at '${bench_path}'. Skipping 'bench init'..."
+            mark_stage_done "STAGE_BENCH_INIT"
+            return 0
+        else
+            msg_warn "Detected incomplete or broken Frappe Bench directory at '${bench_path}'."
+            msg_warn "Cleaning up incomplete bench directory before re-initializing..."
+            rm -rf "$bench_path"
+        fi
+    fi
+
+    local target_py
+    target_py=$(get_target_python_version)
+
+    msg_info "Initializing Frappe Bench with branch '${ERP_VERSION}' using Python ${target_py}..."
     sudo -u "$BENCH_USER" bash -c "
         set -e
         export PATH=\"${user_home}/.local/bin:/usr/local/bin:/usr/bin:\$PATH\"
         cd \"${user_home}\"
         
-        # Find exact python path installed by uv
-        PY_PATH=\$(uv python find 3.11 2>/dev/null || uv python find 3.12 2>/dev/null || which python3)
-        echo \"Using Python binary: \$PY_PATH\"
+        # Find exact python path for target version
+        PY_PATH=\$(uv python find ${target_py} 2>/dev/null || which python3)
+        echo \"[bench init] Executing with Python binary: \$PY_PATH (\$(${PY_PATH} --version 2>/dev/null || true))\"
         
         bench init --frappe-branch \"${ERP_VERSION}\" --python \"\$PY_PATH\" \"${BENCH_NAME}\"
     " >> "$LOG_FILE" 2>&1
@@ -762,6 +974,7 @@ initialize_bench() {
     chmod -R o+rx "$bench_path" 2>/dev/null || true
 
     msg_success "Frappe Bench initialized at ${bench_path}."
+    mark_stage_done "STAGE_BENCH_INIT"
 }
 
 # ------------------------------------------------------------------------------
@@ -773,8 +986,14 @@ create_frappe_site() {
     local bench_path="${user_home}/${BENCH_NAME}"
     local site_dir="${bench_path}/sites/${SITE_NAME}"
 
+    if is_stage_done "STAGE_SITE_CREATE"; then
+        msg_info "Site '${SITE_NAME}' already created. Skipping..."
+        return 0
+    fi
+
     if [ -d "$site_dir" ]; then
-        msg_warn "Site '${SITE_NAME}' already exists. Skipping site creation..."
+        msg_warn "Site directory '${site_dir}' already exists. Skipping site creation..."
+        mark_stage_done "STAGE_SITE_CREATE"
         return 0
     fi
 
@@ -793,12 +1012,18 @@ create_frappe_site() {
     " >> "$LOG_FILE" 2>&1
 
     msg_success "Site '${SITE_NAME}' created successfully."
+    mark_stage_done "STAGE_SITE_CREATE"
 }
 
 # ------------------------------------------------------------------------------
 # App Installation
 # ------------------------------------------------------------------------------
 install_frappe_apps() {
+    if is_stage_done "STAGE_APPS"; then
+        msg_info "Applications already installed on site '${SITE_NAME}'. Skipping..."
+        return 0
+    fi
+
     local user_home
     user_home=$(eval echo "~$BENCH_USER")
     local bench_path="${user_home}/${BENCH_NAME}"
@@ -864,12 +1089,19 @@ install_frappe_apps() {
         msg_info "Installing custom app '${custom_name}' from ${CUSTOM_APP_URL}..."
         install_single_app "$custom_name" "$CUSTOM_APP_BRANCH" "$CUSTOM_APP_URL"
     fi
+
+    mark_stage_done "STAGE_APPS"
 }
 
 # ------------------------------------------------------------------------------
 # Production Setup (Supervisor & Nginx)
 # ------------------------------------------------------------------------------
 configure_production() {
+    if is_stage_done "STAGE_PRODUCTION"; then
+        msg_info "Production services already configured. Skipping..."
+        return 0
+    fi
+
     local user_home
     user_home=$(eval echo "~$BENCH_USER")
     local bench_path="${user_home}/${BENCH_NAME}"
@@ -947,12 +1179,18 @@ EOF
     systemctl reload nginx >> "$LOG_FILE" 2>&1 || systemctl restart nginx >> "$LOG_FILE" 2>&1
 
     msg_success "Production services configured and running."
+    mark_stage_done "STAGE_PRODUCTION"
 }
 
 # ------------------------------------------------------------------------------
 # SSL & Cloudflare Configuration
 # ------------------------------------------------------------------------------
 configure_ssl() {
+    if is_stage_done "STAGE_SSL"; then
+        msg_info "SSL already configured. Skipping..."
+        return 0
+    fi
+
     local user_home
     user_home=$(eval echo "~$BENCH_USER")
     local bench_path="${user_home}/${BENCH_NAME}"
@@ -1031,12 +1269,19 @@ EOF
             msg_info "SSL configuration skipped (HTTP only)."
             ;;
     esac
+
+    mark_stage_done "STAGE_SSL"
 }
 
 # ------------------------------------------------------------------------------
 # Firewall Setup (UFW)
 # ------------------------------------------------------------------------------
 configure_firewall() {
+    if is_stage_done "STAGE_FIREWALL"; then
+        msg_info "Firewall already configured. Skipping..."
+        return 0
+    fi
+
     if [ "$ENABLE_UFW" = true ]; then
         msg_info "Configuring UFW Firewall rules..."
         apt-get install -y ufw >> "$LOG_FILE" 2>&1
@@ -1046,12 +1291,18 @@ configure_firewall() {
         echo "y" | ufw enable >> "$LOG_FILE" 2>&1 || true
         msg_success "UFW enabled: ports 22, ${HTTP_PORT}, 443 allowed."
     fi
+    mark_stage_done "STAGE_FIREWALL"
 }
 
 # ------------------------------------------------------------------------------
 # Automatic Database Backup Cron
 # ------------------------------------------------------------------------------
 configure_backup_cron() {
+    if is_stage_done "STAGE_CRON"; then
+        msg_info "Backup cron already configured. Skipping..."
+        return 0
+    fi
+
     if [ "$ENABLE_BACKUP_CRON" = true ]; then
         msg_info "Setting up daily Frappe backup cron job..."
         local user_home
@@ -1066,6 +1317,8 @@ EOF
         chmod 644 "$cron_file"
         msg_success "Automated daily backup cron job registered."
     fi
+    mark_stage_done "STAGE_CRON"
+    mark_stage_done "STAGE_COMPLETED"
 }
 
 # ------------------------------------------------------------------------------
@@ -1195,6 +1448,14 @@ parse_cli_arguments() {
                 ENABLE_UFW=true
                 shift
                 ;;
+            --resume)
+                RESUME_MODE=true
+                shift
+                ;;
+            --clean|--fresh-start)
+                FORCE_CLEAN=true
+                shift
+                ;;
             --no-cron)
                 ENABLE_BACKUP_CRON=false
                 shift
@@ -1204,6 +1465,8 @@ parse_cli_arguments() {
                 echo ""
                 echo "Options:"
                 echo "  --non-interactive, -y   Run non-interactively without prompting"
+                echo "  --resume                Resume interrupted installation from checkpoint"
+                echo "  --clean                 Discard previous checkpoint and start fresh"
                 echo "  --mode <fresh|existing> Installation mode (default: fresh)"
                 echo "  --version <14|15|16>    ERPNext version (default: 15)"
                 echo "  --domain <domain.com>   Domain name or server IP"
@@ -1251,19 +1514,29 @@ main() {
 
     parse_cli_arguments "$@"
 
-    if [ "$NON_INTERACTIVE" = false ]; then
-        run_interactive_wizard
+    # Check for previous installation progress and offer resume
+    check_resume_option
+
+    if [ "$RESUME_MODE" = false ]; then
+        if [ "$NON_INTERACTIVE" = false ]; then
+            run_interactive_wizard
+        else
+            # Set defaults if missing in non-interactive mode
+            [ -z "$BENCH_USER" ] && BENCH_USER="frappe"
+            [ -z "$DOMAIN_NAME" ] && DOMAIN_NAME=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
+            [ -z "$SITE_NAME" ] && SITE_NAME="$DOMAIN_NAME"
+            [ -z "$DB_ROOT_PASS" ] && DB_ROOT_PASS=$(generate_random_password 16)
+            [ -z "$ADMIN_PASS" ] && ADMIN_PASS=$(generate_random_password 16)
+            print_summary_confirmation
+        fi
+        # Save all options to state file for future resume capability
+        save_all_state_vars
     else
-        # Set defaults if missing in non-interactive mode
-        [ -z "$BENCH_USER" ] && BENCH_USER="frappe"
-        [ -z "$DOMAIN_NAME" ] && DOMAIN_NAME=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
-        [ -z "$SITE_NAME" ] && SITE_NAME="$DOMAIN_NAME"
-        [ -z "$DB_ROOT_PASS" ] && DB_ROOT_PASS=$(generate_random_password 16)
-        [ -z "$ADMIN_PASS" ] && ADMIN_PASS=$(generate_random_password 16)
-        print_summary_confirmation
+        msg_info "Resuming installation with saved settings:"
+        echo -e "  User: ${BENCH_USER} | Site: ${SITE_NAME} | Version: ${ERP_VERSION} | Port: ${HTTP_PORT}"
     fi
 
-    msg_info "Starting installation process at $(date)..."
+    msg_info "Starting / Resuming installation process at $(date)..."
     setup_swap
     setup_user
     install_system_packages
