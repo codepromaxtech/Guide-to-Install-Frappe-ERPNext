@@ -1266,6 +1266,8 @@ create_frappe_site() {
             --no-mariadb-socket
         bench --site \"${SITE_NAME}\" set-maintenance-mode off
         bench --site \"${SITE_NAME}\" enable-scheduler
+        bench use \"${SITE_NAME}\"
+        bench set-config -g default_site \"${SITE_NAME}\"
     " >> "$LOG_FILE" 2>&1
 
     msg_success "Site '${SITE_NAME}' created successfully."
@@ -1369,10 +1371,12 @@ configure_production() {
 
     msg_info "Setting up Production Environment with Nginx & Supervisor..."
 
-    # Configure DNS multitenancy
+    # Set default site and configure DNS multitenancy
     sudo -u "$BENCH_USER" bash -c "
         export PATH=\"${user_home}/.local/bin:\$PATH\"
         cd \"${bench_path}\"
+        bench use \"${SITE_NAME}\"
+        bench set-config -g default_site \"${SITE_NAME}\"
         bench config dns_multitenant on
     " >> "$LOG_FILE" 2>&1
 
@@ -1405,6 +1409,11 @@ configure_production() {
     # If custom HTTP port is set, ensure generated nginx config listens on HTTP_PORT
     if [ "$HTTP_PORT" != "80" ] && [ -f "${bench_path}/config/nginx.conf" ]; then
         sed -i "s/listen 80;/listen ${HTTP_PORT};/g; s/listen \\[::\\]:80;/listen \\[::\\]:${HTTP_PORT};/g" "${bench_path}/config/nginx.conf"
+    fi
+
+    # Ensure requests with server IP or unknown host header route to SITE_NAME
+    if [ -f "${bench_path}/config/nginx.conf" ]; then
+        sed -i "s/default \$host;/default ${SITE_NAME};/g" "${bench_path}/config/nginx.conf"
     fi
 
     # Ensure log format 'main' is defined for Debian/Ubuntu Nginx
