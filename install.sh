@@ -454,6 +454,7 @@ DOMAIN_TYPE="domain"        # "domain" or "local"
 DOMAIN_NAME=""
 SITE_NAME=""
 HTTP_PORT="80"
+PORT_EXPLICITLY_SET=false
 SSL_TYPE="letsencrypt"      # "letsencrypt", "cloudflare", "selfsigned", "none"
 CF_MODE="proxy"             # "proxy" (Full/Flexible) or "origin" (Origin CA) or "tunnel"
 BENCH_USER=""
@@ -524,6 +525,43 @@ generate_random_password() {
     tr -dc 'A-Za-z0-9!#%*+=' < /dev/urandom | head -c "$len" 2>/dev/null || date +%s | sha256sum | base64 | head -c "$len"
 }
 
+is_port_in_use() {
+    local port="$1"
+    [ -z "$port" ] && return 1
+    if command -v ss >/dev/null 2>&1; then
+        ss -tuln | grep -qE "(:|\\])${port}\\s" && return 0
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tuln | grep -qE "(:|\\])${port}\\s" && return 0
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -iTCP:"${port}" -sTCP:LISTEN -P -n >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+find_next_available_port() {
+    local candidate="${1:-80}"
+    if ! is_port_in_use "$candidate"; then
+        echo "$candidate"
+        return 0
+    fi
+    local common_ports=(8088 8080 8090 8008 8888 8081 8085 9080)
+    for p in "${common_ports[@]}"; do
+        if ! is_port_in_use "$p"; then
+            echo "$p"
+            return 0
+        fi
+    done
+    local p=8089
+    while [ "$p" -lt 9999 ]; do
+        if ! is_port_in_use "$p"; then
+            echo "$p"
+            return 0
+        fi
+        p=$((p + 1))
+    done
+    echo "8088"
+}
+
 # ------------------------------------------------------------------------------
 # System & Pre-flight Checks
 # ------------------------------------------------------------------------------
@@ -576,7 +614,7 @@ detect_system() {
 }
 
 detect_services() {
-    msg_info "Checking existing system services..."
+    msg_info "Checking existing system services and port availability..."
     local db_running=false
     local nginx_running=false
     local apache_running=false
@@ -603,8 +641,18 @@ detect_services() {
     fi
 
     # Check port 80 & 443
-    if ss -tuln | grep -q ':80 '; then
-        msg_warn "Port 80 is currently occupied by another process."
+    if is_port_in_use 80; then
+        local p80_proc
+        p80_proc=$(ss -tulpn 2>/dev/null | grep -E '(:|\])80\s' | head -n1 | grep -o 'users:(([^)]*))' | sed 's/users:(("//;s/".*//' || echo "another web server")
+        local alt_port
+        alt_port=$(find_next_available_port 80)
+        msg_warn "Port 80 is occupied by [${p80_proc:-another service}]. Installer can automatically assign available port ${BOLD}${alt_port}${NC}."
+    else
+        msg_info "Port 80 is free and available."
+    fi
+
+    if is_port_in_use 443; then
+        msg_info "Port 443 (HTTPS) is currently in use."
     fi
 }
 
@@ -688,12 +736,38 @@ run_interactive_wizard() {
     fi
 
     # Web port
-    if [ "$INSTALL_MODE" == "existing" ] && ss -tuln | grep -q ':80 '; then
-        msg_warn "Port 80 is in use. You can use port 80 with Nginx virtual hosts, or assign a custom HTTP port."
-        HTTP_PORT=$(prompt_with_default "Enter HTTP web port" "80")
+    local suggested_port
+    suggested_port=$(find_next_available_port 80)
+    if [ "$suggested_port" != "80" ]; then
+        msg_warn "Port 80 is occupied by an existing service."
+        echo -e "${YELLOW}Suggested available HTTP port: ${BOLD}${suggested_port}${NC}"
+        HTTP_PORT=$(prompt_with_default "Enter HTTP web port" "$suggested_port")
     else
         HTTP_PORT=$(prompt_with_default "Enter HTTP web port" "80")
     fi
+
+    # Validate chosen port
+    while true; do
+        if [[ ! "$HTTP_PORT" =~ ^[0-9]+$ ]] || [ "$HTTP_PORT" -lt 1 ] || [ "$HTTP_PORT" -gt 65535 ]; then
+            msg_warn "Invalid port '$HTTP_PORT'. Must be a number between 1 and 65535."
+            HTTP_PORT=$(prompt_with_default "Enter HTTP web port" "$suggested_port")
+            continue
+        fi
+
+        if is_port_in_use "$HTTP_PORT"; then
+            msg_warn "Port ${HTTP_PORT} is currently in use by another process!"
+            local next_p
+            next_p=$(find_next_available_port "$HTTP_PORT")
+            local use_other
+            use_other=$(prompt_with_default "Use next available port [${next_p}] instead? [Y/n]" "y")
+            if [[ "$use_other" =~ ^[Yy]$ ]]; then
+                HTTP_PORT="$next_p"
+                msg_info "Selected port: ${HTTP_PORT}"
+                break
+            fi
+        fi
+        break
+    done
     echo ""
 
     echo -e "${BOLD}${MAGENTA}--- STEP 4: SSL & Reverse Proxy Setup ---${NC}"
@@ -1380,14 +1454,27 @@ configure_production() {
         bench config dns_multitenant on
     " >> "$LOG_FILE" 2>&1
 
-    # Add custom domain to site if specified
-    if [ "$DOMAIN_TYPE" == "domain" ] && [ "$DOMAIN_NAME" != "$SITE_NAME" ]; then
+    # Register DOMAIN_NAME or server IP to site domains if different from SITE_NAME
+    if [ -n "$DOMAIN_NAME" ] && [ "$DOMAIN_NAME" != "$SITE_NAME" ]; then
         sudo -u "$BENCH_USER" bash -c "
             export PATH=\"${user_home}/.local/bin:\$PATH\"
             cd \"${bench_path}\"
-            bench setup add-domain \"${DOMAIN_NAME}\" --site \"${SITE_NAME}\"
+            bench setup add-domain \"${DOMAIN_NAME}\" --site \"${SITE_NAME}\" 2>/dev/null || true
         " >> "$LOG_FILE" 2>&1
     fi
+
+    # Also register host IP addresses and loopback so direct browser access by IP works natively
+    local host_ips
+    host_ips=$(hostname -I 2>/dev/null || echo "")
+    for ip in $host_ips "127.0.0.1"; do
+        if [ -n "$ip" ] && [ "$ip" != "$SITE_NAME" ] && [ "$ip" != "$DOMAIN_NAME" ]; then
+            sudo -u "$BENCH_USER" bash -c "
+                export PATH=\"${user_home}/.local/bin:\$PATH\"
+                cd \"${bench_path}\"
+                bench setup add-domain \"${ip}\" --site \"${SITE_NAME}\" 2>/dev/null || true
+            " >> "$LOG_FILE" 2>&1
+        fi
+    done
 
     # Set custom HTTP port if chosen
     if [ "$HTTP_PORT" != "80" ]; then
@@ -1681,6 +1768,7 @@ parse_cli_arguments() {
                 ;;
             --port)
                 HTTP_PORT="$2"
+                PORT_EXPLICITLY_SET=true
                 shift 2
                 ;;
             --ssl)
@@ -1824,6 +1912,12 @@ main() {
             [ -z "$SITE_NAME" ] && SITE_NAME="$DOMAIN_NAME"
             [ -z "$DB_ROOT_PASS" ] && DB_ROOT_PASS=$(generate_random_password 16)
             [ -z "$ADMIN_PASS" ] && ADMIN_PASS=$(generate_random_password 16)
+            if [ "$PORT_EXPLICITLY_SET" = false ] && is_port_in_use "$HTTP_PORT"; then
+                local auto_port
+                auto_port=$(find_next_available_port "$HTTP_PORT")
+                msg_warn "Default port ${HTTP_PORT} is currently in use. Auto-assigning available port: ${BOLD}${auto_port}${NC}."
+                HTTP_PORT="$auto_port"
+            fi
             print_summary_confirmation
         fi
         # Save all options to state file for future resume capability
